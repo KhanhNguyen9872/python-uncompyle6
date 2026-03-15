@@ -1,0 +1,5 @@
+# Test with statement (simplest — no import)
+f = open(__file__)
+data = f.read()
+f.close()
+print(len(data))

@@ -35,7 +35,16 @@ import sys
 from collections import deque
 
 from xdis import check_object_path, iscode, load_module
-from xdis.version_info import PythonImplementation, version_tuple_to_str
+from xdis.version_info import version_tuple_to_str
+
+# PythonImplementation was added in xdis >= 6.2
+try:
+    from xdis.version_info import PythonImplementation
+except ImportError:
+    class PythonImplementation:
+        """Fallback for xdis < 6.2"""
+        PyPy = "PyPy"
+        CPython = "CPython"
 
 from uncompyle6.scanner import get_scanner
 

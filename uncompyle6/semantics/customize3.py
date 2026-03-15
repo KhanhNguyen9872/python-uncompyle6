@@ -24,6 +24,7 @@ from uncompyle6.semantics.customize35 import customize_for_version35
 from uncompyle6.semantics.customize36 import customize_for_version36
 from uncompyle6.semantics.customize37 import customize_for_version37
 from uncompyle6.semantics.customize38 import customize_for_version38
+from uncompyle6.semantics.customize312 import customize_for_version312
 from uncompyle6.semantics.helper import find_code_node, gen_function_parens_adjust
 from uncompyle6.semantics.make_function3 import make_function3_annotate
 from uncompyle6.util import get_code_name
@@ -364,6 +365,9 @@ def customize_for_version3(self, version: tuple):
                     customize_for_version37(self, version)
                     if version >= (3, 8):
                         customize_for_version38(self, version)
+                        if version >= (3, 12):
+                            customize_for_version312(self, version)
+                            pass  # version >= 3.12
                         pass  # version >= 3.8
                     pass  # 3.7
                 pass  # 3.6

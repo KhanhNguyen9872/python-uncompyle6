@@ -1268,6 +1268,13 @@ class SourceWalker(GenericASTTraversal, NonterminalActions, ComprehensionMixin):
                         del tokens[-2:]
                     else:
                         tokens.append(Token("RETURN_LAST"))
+                elif tokens[-1].kind == "RETURN_CONST":
+                    # Python 3.12+: RETURN_CONST replaces LOAD_CONST + RETURN_VALUE
+                    if tokens[-1].attr is None or tokens[-1].pattr == "None":
+                        # Implicit return None at end of module - remove it
+                        del tokens[-1:]
+                    else:
+                        tokens.append(Token("RETURN_LAST"))
             if len(tokens) == 0:
                 return PASS
 

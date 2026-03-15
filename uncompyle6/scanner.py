@@ -38,7 +38,16 @@ from xdis import (
     next_offset,
 )
 from xdis.op_imports import get_opcode_module
-from xdis.version_info import IS_PYPY, PythonImplementation, version_tuple_to_str
+from xdis.version_info import IS_PYPY, version_tuple_to_str
+
+# PythonImplementation was added in xdis >= 6.2
+try:
+    from xdis.version_info import PythonImplementation
+except ImportError:
+    class PythonImplementation:
+        """Fallback for xdis < 6.2"""
+        PyPy = "PyPy"
+        CPython = "CPython"
 
 from uncompyle6.scanners.tok import Token
 
@@ -68,6 +77,7 @@ PYTHON_VERSIONS = frozenset(
         (3, 6),
         (3, 7),
         (3, 8),
+        (3, 12),
     )
 )
 
