@@ -469,6 +469,11 @@ class TreeTransform(GenericASTTraversal, object):
         self.ast = copy(parse_tree)
         del parse_tree
         self.ast = self.traverse(self.ast, is_lambda=False)
+
+        # Post-transform pass: fix nested return_if_stmts in 3.12+
+        if self.version >= (3, 12):
+            self._split_return_if_stmts(self.ast)
+
         n = len(self.ast)
 
         try:
@@ -505,6 +510,110 @@ class TreeTransform(GenericASTTraversal, object):
             pass
 
         return self.ast
+
+    def _split_return_if_stmts(self, node):
+        """Post-transform pass: detect ifstmt → _ifstmts_jump → return_if_stmts
+        → _stmts [return, sibling_blocks...] and split the sibling_blocks out
+        to the parent container's level. This fixes 3.12 bytecode where
+        consecutive if-return blocks get absorbed into a single _stmts node,
+        causing incorrect nesting."""
+        if not isinstance(node, SyntaxTree):
+            return node
+
+        # Recursively process children first (bottom-up)
+        for i in range(len(node)):
+            if isinstance(node[i], SyntaxTree):
+                self._split_return_if_stmts(node[i])
+
+        # Now check if THIS node is a stmts-like container that has
+        # children that need splitting
+        if node.kind not in ('_stmts', 'stmts', 'l_stmts', 'c_stmts',
+                             'stmts_opt', 'sstmt'):
+            return node
+
+        # Look through children for ifstmt (wrapped in sstmt/stmt) with the pattern
+        new_children = []
+        changed = False
+        for child in node:
+            extracted = self._try_split_ifstmt(child)
+            if extracted is not None:
+                new_children.extend(extracted)
+                changed = True
+            else:
+                new_children.append(child)
+
+        if changed:
+            node.data = new_children
+        return node
+
+    def _try_split_ifstmt(self, node):
+        """Check if node wraps an ifstmt/whilestmt38 where the body _stmts
+        contains [return, sibling_blocks...]. If so, return a list of nodes:
+        [modified_wrapper, sibling1, sibling2, ...].
+        Returns None if no split needed."""
+        if not isinstance(node, SyntaxTree):
+            return None
+
+        # Navigate wrappers: sstmt → stmt → target OR direct target
+        target = node
+        if target.kind in ('sstmt', 'stmt', 'lastc_stmt', 'lastl_stmt'):
+            if len(target) >= 1 and isinstance(target[0], SyntaxTree):
+                target = target[0]
+            else:
+                return None
+
+        # Find the _stmts body inside the target node
+        stmts = None
+
+        if target.kind in ('whilestmt38',):
+            # whilestmt38 children: [_come_froms, testexpr, _stmts, COME_FROM]
+            if len(target) >= 3 and isinstance(target[2], SyntaxTree):
+                if target[2].kind in ('_stmts', 'stmts', 'l_stmts', 'c_stmts'):
+                    stmts = target[2]
+        elif target.kind in ('ifstmt', 'ifstmtl'):
+            # ifstmt children: [testexpr, _ifstmts_jump]
+            if len(target) >= 2 and isinstance(target[1], SyntaxTree):
+                body = target[1]
+                if body.kind in ('_ifstmts_jump', '_ifstmts_jumpl'):
+                    if len(body) >= 1 and isinstance(body[0], SyntaxTree):
+                        inner = body[0]
+                        if inner.kind == 'return_if_stmts':
+                            if len(inner) >= 1 and isinstance(inner[0], SyntaxTree):
+                                if inner[0].kind in ('_stmts', 'stmts', 'l_stmts', 'c_stmts'):
+                                    stmts = inner[0]
+                        elif inner.kind in ('_stmts', 'stmts', 'l_stmts', 'c_stmts'):
+                            stmts = inner
+
+        if stmts is None:
+            return None
+
+        children = list(stmts)
+        if len(children) < 2:
+            return None
+
+        # First child must be a return statement
+        first = children[0]
+        if not isinstance(first, SyntaxTree):
+            return None
+        if first.kind != 'return':
+            return None
+
+        # Pattern matched! Split:
+        # Keep only [return] in the _stmts, move siblings out
+        stmts.data = [first]
+
+        # The remaining children become siblings at the parent level
+        result = [node]  # the modified wrapper
+        for sibling in children[1:]:
+            # Wrap each sibling in sstmt if needed
+            if isinstance(sibling, SyntaxTree) and sibling.kind not in ('sstmt', 'stmt'):
+                wrapped = SyntaxTree('sstmt', [sibling])
+                wrapped.transformed_by = '_split_return_if_stmts'
+                result.append(wrapped)
+            else:
+                result.append(sibling)
+
+        return result
 
     # Write template_engine
     # def template_engine

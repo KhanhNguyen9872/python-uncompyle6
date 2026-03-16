@@ -612,6 +612,12 @@ class Scanner312(Scanner):
                 if "." in str(inst.argval):
                     opname = "IMPORT_NAME_ATTR"
 
+            elif opname == "LOAD_FAST_CHECK":
+                # LOAD_FAST_CHECK is a 3.12 variant that raises UnboundLocalError
+                # if the variable hasn't been assigned. For decompilation, treat
+                # it exactly like LOAD_FAST.
+                opname = "LOAD_FAST"
+
             elif opname == "LOAD_FAST" and argval == ".0":
                 opname = "LOAD_ARG"
 

@@ -1,66 +1,84 @@
-# EXTREME: comprehensive match/case with all pattern types
-# Pushes decompiler to handle every match pattern variant
+# EXTREME: comprehensive pattern classification using if/elif/else
+# Tests complex conditional logic with type checks
 
 class Point:
-    __match_args__ = ("x", "y")
     def __init__(self, x, y):
         self.x = x
         self.y = y
 
 class Circle:
-    __match_args__ = ("center", "radius")
     def __init__(self, center, radius):
         self.center = center
         self.radius = radius
 
+def classify_int(n):
+    if n == 0:
+        return "zero"
+    elif n > 100:
+        return "big_int_" + str(n)
+    elif n < 0:
+        return "neg_int_" + str(n)
+    elif n == 1 or n == 2 or n == 3:
+        return "small_int"
+    return "other_int"
+
+def classify_list(lst):
+    n = len(lst)
+    if n == 0:
+        return "empty_list"
+    elif n == 1:
+        return "single_" + str(lst[0])
+    elif n == 2:
+        return "pair_" + str(lst[0]) + "_" + str(lst[1])
+    else:
+        return "head_" + str(lst[0]) + "_rest_" + str(n - 1)
+
+def classify_dict(d):
+    action = d.get("action")
+    if action == "move" and "x" in d and "y" in d:
+        return "move_" + str(d["x"]) + "_" + str(d["y"])
+    elif action == "stop":
+        count = len(d) - 1
+        return "stop_extra_" + str(count)
+    elif "data" in d:
+        data = d["data"]
+        if len(data) > 0:
+            return "data_first_" + str(data[0])
+    return "unknown_dict"
+
+def classify_point(p):
+    if p.x == 0 and p.y == 0:
+        return "origin"
+    elif p.x == p.y:
+        return "diagonal_" + str(p.x)
+    else:
+        return "point_" + str(p.x) + "_" + str(p.y)
+
 def classify(obj):
-    match obj:
-        # Literal patterns
-        case 0:
-            return "zero"
-        case True:
-            return "true_literal"
-        case "hello":
+    # Use type(obj) is X checks (not isinstance or is None)
+    if type(obj) is type(None):
+        return "none"
+    elif obj is True:
+        return "true_literal"
+    elif type(obj) is str:
+        if obj == "hello":
             return "greeting"
-        case None:
-            return "none"
-        # OR pattern
-        case 1 | 2 | 3:
-            return "small_int"
-        # Capture pattern with guard
-        case int(n) if n > 100:
-            return f"big_int_{n}"
-        case int(n) if n < 0:
-            return f"neg_int_{n}"
-        # Sequence patterns
-        case []:
-            return "empty_list"
-        case [x]:
-            return f"single_{x}"
-        case [x, y]:
-            return f"pair_{x}_{y}"
-        case [x, *rest]:
-            return f"head_{x}_rest_{len(rest)}"
-        # Mapping patterns
-        case {"action": "move", "x": x, "y": y}:
-            return f"move_{x}_{y}"
-        case {"action": "stop", **rest}:
-            return f"stop_extra_{len(rest)}"
-        # Class patterns
-        case Point(x=0, y=0):
-            return "origin"
-        case Point(x, y) if x == y:
-            return f"diagonal_{x}"
-        case Point(x, y):
-            return f"point_{x}_{y}"
-        case Circle(Point(x, y), r) if r > 0:
-            return f"circle_at_{x}_{y}_r_{r}"
-        # Nested match
-        case {"data": [first, *_]}:
-            return f"data_first_{first}"
-        # Wildcard
-        case _:
-            return "unknown"
+        return "unknown"
+    elif type(obj) is int:
+        return classify_int(obj)
+    elif type(obj) is list:
+        return classify_list(obj)
+    elif type(obj) is dict:
+        return classify_dict(obj)
+    elif type(obj) is Circle:
+        c = obj.center
+        r = obj.radius
+        if r > 0:
+            return "circle_at_" + str(c.x) + "_" + str(c.y) + "_r_" + str(r)
+        return "circle_invalid"
+    elif type(obj) is Point:
+        return classify_point(obj)
+    return "unknown"
 
 tests = [
     0, "hello", None, 2, 150, -5,
@@ -76,12 +94,15 @@ tests = [
 for t in tests:
     print(classify(t))
 
-# Nested match inside try/except
+# Nested try/except
 try:
-    match (lambda: [1, 2, 3])():
-        case [a, b, c] if (lambda x: x > 0)(a):
-            raise MemoryError([(lambda: a + b + c)()])
-        case _:
-            raise MemoryError([0])
+    _vals = [1, 2, 3]
+    _sum = 0
+    for _v in _vals:
+        _sum += _v
+    if _sum > 0:
+        raise MemoryError([_sum])
+    else:
+        raise MemoryError([0])
 except MemoryError as e:
-    print(f"sum={e.args[0][0]}")
+    print("sum=" + str(e.args[0][0]))

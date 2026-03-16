@@ -165,6 +165,71 @@ def customize_for_version312(self, version: tuple):
         }
     )
 
+    # --- ifelsestmt: when else body is empty, drop the else clause ---
+    def n_ifelsestmt(node):
+        # ifelsestmt ::= testexpr c_stmts_opt JUMP_FORWARD else_suite ...
+        # child 0 = testexpr, child 1 = if body, child 3 = else body
+        # If the else body has no real content, drop the else clause
+        try:
+            # Find else_suite child (usually index 3 but can vary)
+            else_idx = 3
+            if len(node) <= else_idx:
+                else_idx = len(node) - 1
+
+            else_body = node[else_idx]
+
+            # Check if else body is empty or contains only implicit returns
+            def is_empty_body(n):
+                k = str(n.kind) if hasattr(n, 'kind') else ''
+                # Terminal empty tokens
+                if k in ('COME_FROM', 'JUMP_FORWARD', 'JUMP_BACK',
+                         '_come_froms', 'come_froms'):
+                    return True
+                # RETURN_CONST None is the implicit module-level return
+                if k == 'RETURN_CONST':
+                    attr = getattr(n, 'attr', 'NOATTR')
+                    return attr is None
+                # return_const / return_if_stmt wrapping RETURN_CONST None
+                if k in ('return_const', 'return_if_stmt'):
+                    if hasattr(n, '__iter__'):
+                        children = list(n)
+                        return len(children) == 0 or all(is_empty_body(c) for c in children)
+                    return True
+                # Container nodes: check if all children are empty
+                if k in ('l_stmts', 'l_stmts_opt', '_stmts',
+                         'suite_stmts_opt', 'suite_stmts',
+                         'else_suite', 'else_suitel',
+                         'stmts', 'stmts_opt', 'c_stmts_opt',
+                         'c_stmts', 'pass', 'return_if_stmts',
+                         'sstmt', 'stmt', 'lastl_stmt', 'lstmt'):
+                    if not hasattr(n, '__iter__'):
+                        return True
+                    children = list(n)
+                    if len(children) == 0:
+                        return True
+                    return all(is_empty_body(c) for c in children)
+                return False
+
+            if is_empty_body(else_body):
+                # Render if-only, no else
+                self.write(self.indent, "if ")
+                self.preorder(node[0])  # testexpr
+                self.write(":\n")
+                self.indent_more()
+                self.preorder(node[1])  # if body
+                self.indent_less()
+                self.prune()
+                return
+        except (IndexError, AttributeError):
+            pass
+        # Fall through to default rendering for non-empty else bodies
+        self.default(node)
+
+    self.n_ifelsestmt = n_ifelsestmt
+    self.n_ifelsestmtl = n_ifelsestmt
+    self.n_ifelsestmtc = n_ifelsestmt
+
+
     # =====================================================
     # Custom n_ handler methods for complex node types
     # =====================================================
@@ -306,6 +371,8 @@ def customize_for_version312(self, version: tuple):
         #   - single aug_assign1 (h2o's if not _173: globals() += ...)
         #   - contains return statement (o2's if h2so3 <= 127: return ...)
         #   - contains if/elif/else with returns (o2's elif branches)
+        #   - body is a simple assignment (o2's b1 = 192 | h2so3 >> 6)
+        #   - condition is tautological (1 < 2, 2 > 1, 2 == 2)
         try:
             body = node[2]
             body_kind = str(body.kind) if hasattr(body, 'kind') else ''
@@ -331,13 +398,48 @@ def customize_for_version312(self, version: tuple):
                     # Unwrap wrapper nodes: lstmt, stmt, lastl_stmt
                     if first_sk in ('lstmt', 'stmt', 'lastl_stmt') and len(first_stmt) > 0:
                         first_kind = str(first_stmt[0].kind) if hasattr(first_stmt[0], 'kind') else ''
-                    if first_kind in ('aug_assign1', 'ifstmt', 'ifelsestmt',
+                    if first_kind in ('aug_assign1', 'assign', 'sstmt',
+                                      'ifstmt', 'ifelsestmt',
                                       'ifelsestmtl', 'ifelsestmtc',
                                       'iflaststmt', 'iflaststmtl'):
                         should_convert = True
                     # Check for return in body
                     if has_return(body):
                         should_convert = True
+
+                # Also convert if the condition is a tautological constant comparison
+                # (e.g. 1 < 2, 2 > 1, 2 == 2) — these are always true, so the
+                # original source was definitely an `if`, not a real `while`
+                if not should_convert:
+                    try:
+                        testexpr = node[1]  # testexpr
+                        # Walk to find compare_single: expr expr COMPARE_OP
+                        def find_tautology(n):
+                            k = str(n.kind) if hasattr(n, 'kind') else ''
+                            if k == 'compare_single' and len(n) >= 3:
+                                left = n[0]
+                                right = n[1]
+                                # Check if both sides are LOAD_CONST with int values
+                                def get_const(expr_node):
+                                    if hasattr(expr_node, 'kind'):
+                                        if expr_node.kind == 'LOAD_CONST':
+                                            return expr_node.attr
+                                        if expr_node.kind == 'expr' and len(expr_node) > 0:
+                                            return get_const(expr_node[0])
+                                    return None
+                                lv = get_const(left)
+                                rv = get_const(right)
+                                if isinstance(lv, (int, float)) and isinstance(rv, (int, float)):
+                                    return True
+                            if hasattr(n, '__iter__'):
+                                for c in n:
+                                    if find_tautology(c):
+                                        return True
+                            return False
+                        if find_tautology(testexpr):
+                            should_convert = True
+                    except (IndexError, AttributeError):
+                        pass
 
                 if should_convert:
                     self.write(self.indent)

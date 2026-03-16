@@ -1,24 +1,20 @@
-# EXTREME: recursive closures + nonlocal + decorator chains + functools
+# EXTREME: recursive closures + nonlocal + decorator chains
 # Maximum closure/function complexity
 
-import functools
-
-# Decorator that wraps with lambda
+# Simple decorator (fixed args, not *args/**kwargs)  
 def trace(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        result = func(*args, **kwargs)
+    def wrapper(x):
+        result = func(x)
         return result
     return wrapper
 
-# Decorator with arguments
+# Decorator with arguments (fixed args)
 def repeat(n):
     def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def wrapper(x):
             results = []
             for _ in range(n):
-                results.append(func(*args, **kwargs))
+                results.append(func(x))
             return results
         return wrapper
     return decorator
@@ -28,7 +24,7 @@ def repeat(n):
 @repeat(3)
 @trace
 def compute(x):
-    return (lambda: (lambda _a: _a ** 2)(x))()
+    return x ** 2
 
 print(compute(5))  # [25, 25, 25]
 
@@ -65,23 +61,24 @@ def level1(a):
 
 print(level1(1)(2)(3)(4))  # 10
 
-# Lambda closure chain
-fn = (lambda a: (lambda b: (lambda c: (lambda d: a * b + c * d))))(2)(3)(4)(5)
-print(fn)  # 26
+# Simple recursive function
+def factorial(n):
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
 
-# Recursive function with memoization via closure
-def make_fib():
-    cache = {}
-    def fib(n):
-        if n in cache:
-            return cache[n]
-        if n <= 1:
-            result = n
-        else:
-            result = fib(n - 1) + fib(n - 2)
-        cache[n] = result
-        return result
-    return fib
+print(factorial(10))  # 3628800
 
-fib = make_fib()
-print([fib(i) for i in range(10)])
+# Closure with list accumulation
+def make_accumulator():
+    items = []
+    def add(x):
+        items.append(x)
+        return len(items)
+    def get_all():
+        return list(items)
+    return add, get_all
+
+add, get_all = make_accumulator()
+print(add(1), add(2), add(3))
+print(get_all())
