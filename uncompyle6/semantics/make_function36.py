@@ -98,16 +98,18 @@ def make_function36(self, node, is_lambda, nested=1, code_node=None):
         annotate_node = node[i]
         if annotate_node == "expr":
             annotate_node = annotate_node[0]
-            annotate_name_node = annotate_node[-1]
-            if annotate_node == "dict" and annotate_name_node.kind.startswith(
-                "BUILD_CONST_KEY_MAP"
-            ):
-                types = [self.traverse(n, indent="") for n in annotate_node[:-2]]
-                names = annotate_node[-2].attr
-                length = len(types)
-                assert length == len(names)
-                for i in range(length):
-                    annotate_dict[names[i]] = types[i]
+            if hasattr(annotate_node, '__len__') and len(annotate_node) > 0:
+                annotate_name_node = annotate_node[-1]
+                if annotate_node == "dict" and annotate_name_node.kind.startswith(
+                    "BUILD_CONST_KEY_MAP"
+                ):
+                    types = [self.traverse(n, indent="") for n in annotate_node[:-2]]
+                    names = annotate_node[-2].attr
+                    length = len(types)
+                    assert length == len(names)
+                    for i in range(length):
+                        annotate_dict[names[i]] = types[i]
+                    pass
                 pass
             pass
         i -= 1
@@ -162,9 +164,17 @@ def make_function36(self, node, is_lambda, nested=1, code_node=None):
             noneInNames=("None" in code.co_names),
         )
     except (ParserError, ParserError2) as p:
-        self.write(str(p))
-        if not self.tolerate_errors:
-            self.ERROR = p
+        # For Python 3.12, write error as comment and continue
+        # instead of aborting the entire file
+        if hasattr(self, 'version') and self.version >= (3, 12):
+            func_name = code.co_name if hasattr(code, 'co_name') else '<unknown>'
+            self.write("# Unable to decompile function body: %s\n" % func_name)
+            self.write(self.indent + "# Parse error: %s\n" % str(p))
+            self.write(self.indent + "...\n")
+        else:
+            self.write(str(p))
+            if not self.tolerate_errors:
+                self.ERROR = p
         return
 
     i = len(paramnames) - len(defparams)

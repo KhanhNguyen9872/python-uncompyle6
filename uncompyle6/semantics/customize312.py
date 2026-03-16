@@ -161,7 +161,7 @@ def customize_for_version312(self, version: tuple):
 
             # ===== GENERATORS =====
 
-            "return_generator312": (""),
+            "return_generator312": ("",),
         }
     )
 

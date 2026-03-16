@@ -209,9 +209,200 @@ class Python312Parser(Python38Parser):
          stmt               ::= funcdef312
          funcdef312         ::= mkfunc312 store
          mkfunc312          ::= LOAD_CODE LOAD_STR MAKE_FUNCTION_0
+
+         # Closure function: uses LOAD_CLOSURE + BUILD_TUPLE + MAKE_FUNCTION_8/12
+         # MAKE_FUNCTION_8 = closure, MAKE_FUNCTION_12 = annotation+closure
+         mkfunc312          ::= load_closure LOAD_CODE LOAD_STR MAKE_FUNCTION_8
+         mkfunc312          ::= expr load_closure LOAD_CODE LOAD_STR MAKE_FUNCTION_12
+
+         # Decorated function definitions (non-closure)
          mkfuncdeco312      ::= expr mkfunc312 CALL_FUNCTION_1
+         # In 3.12, CALL 0 is used to apply decorator: decorator(func)
+         # The callable+arg are already on stack from the decorator expression
+         mkfuncdeco312      ::= expr mkfunc312 CALL_FUNCTION_0
          stmt               ::= funcdefdeco312
          funcdefdeco312     ::= mkfuncdeco312 store
+
+         # Closure function definition without decorator
+         stmt               ::= funcdef312_closure
+         funcdef312_closure ::= mkfunc312 store
+
+         # ===== YIELD FROM =====
+         # yield from expr compiles to:
+         # expr GET_YIELD_FROM_ITER LOAD_CONST(None) SEND(end) YIELD_VALUE JUMP_BACK END_SEND POP_TOP
+         expr               ::= yield_from312
+         yield_from312      ::= expr GET_YIELD_FROM_ITER LOAD_CONST
+                                 _come_froms SEND YIELD_VALUE
+                                 _come_froms JUMP_BACK
+                                 _come_froms END_SEND
+         stmt               ::= yield_from_stmt312
+         yield_from_stmt312 ::= yield_from312 POP_TOP
+
+         # ===== AWAIT =====
+         # await expr compiles to:
+         # expr GET_AWAITABLE LOAD_CONST(None) SEND(end) YIELD_VALUE JUMP_BACK END_SEND
+         expr               ::= await_expr312
+         await_expr312      ::= expr GET_AWAITABLE LOAD_CONST
+                                 _come_froms SEND YIELD_VALUE
+                                 _come_froms JUMP_BACK
+                                 _come_froms END_SEND
+         stmt               ::= await_stmt312
+         await_stmt312      ::= await_expr312 POP_TOP
+
+         # ===== LOAD_SUPER_ATTR =====
+         # super().attr in 3.12: LOAD_GLOBAL super LOAD_DEREF __class__ LOAD_FAST self LOAD_SUPER_ATTR attr
+         expr               ::= super_attr312
+         super_attr312      ::= expr expr expr LOAD_SUPER_ATTR
+
+         # ===== CALL_FUNCTION_EX =====
+         # Calls with *args and/or **kwargs
+         # CALL_FUNCTION_EX 0 = positional args only (f(*args))
+         # CALL_FUNCTION_EX 1 = keyword and positional (f(*args, **kwargs))
+         expr               ::= call_ex312
+         call_ex312         ::= expr expr CALL_FUNCTION_EX
+         call_ex312         ::= expr expr expr DICT_MERGE CALL_FUNCTION_EX
+         call_ex312         ::= expr expr BUILD_MAP_0 expr DICT_MERGE CALL_FUNCTION_EX
+
+         # ===== STRUCTURAL PATTERN MATCHING (match/case) =====
+         # match subject: case pattern1: body1 ...
+         stmt               ::= match_case_stmt312
+
+         # match statement: subject followed by case arms and optional default
+         match_case_stmt312  ::= expr match_case_arms312 match_case_default312
+         match_case_stmt312  ::= expr match_case_arms312
+         match_case_arms312  ::= match_case_arm312+
+
+         # Individual case arm patterns:
+
+         # case None / case True / case False (singleton match)
+         # COPY POP_JUMP_IF_NOT_NONE POP_TOP body
+         match_case_arm312  ::= COPY POP_JUMP_IF_NOT_NONE POP_TOP match_case_body312 _come_froms
+         match_case_arm312  ::= COPY expr IS_OP POP_JUMP_IF_FALSE POP_TOP match_case_body312 _come_froms
+
+         # case <literal> (value match)
+         match_case_arm312  ::= COPY expr COMPARE_OP POP_JUMP_IF_FALSE POP_TOP match_case_body312 _come_froms
+
+         # case <Type>() (class match without capture)
+         match_case_arm312  ::= COPY expr LOAD_CONST MATCH_CLASS match_class_check312 _come_froms
+         # case <Type>(x, y) with guard
+         match_case_arm312  ::= COPY expr LOAD_CONST MATCH_CLASS match_class_capture312 _come_froms
+
+         # case <Type>() | <Type>() (or-pattern with classes)
+         match_case_arm312  ::= COPY COPY expr LOAD_CONST MATCH_CLASS match_class_check312
+                                 match_or_class312 POP_TOP _come_froms
+
+         # Match class check (no capture): POP_JUMP_IF_NONE ... POP_TOP POP_TOP return/body
+         match_class_check312 ::= COPY POP_JUMP_IF_NONE match_class_unpack312
+                                   POP_TOP match_case_body312 _come_froms POP_TOP
+
+         # Match class with guard: unpack, store, guard check, body
+         match_class_capture312 ::= COPY POP_JUMP_IF_NONE match_class_unpack312
+                                     match_class_stores312 match_guard312
+                                     POP_TOP match_case_body312 _come_froms POP_TOP
+
+         # Match class capture with no guard
+         match_class_capture312 ::= COPY POP_JUMP_IF_NONE match_class_unpack312
+                                     match_class_stores312
+                                     POP_TOP match_case_body312 _come_froms POP_TOP
+
+         match_class_unpack312 ::= UNPACK_SEQUENCE
+         match_class_stores312 ::= store+
+
+         # Match guard (if condition within a case arm)
+         match_guard312     ::= expr COMPARE_OP POP_JUMP_IF_FALSE
+         match_guard312     ::= expr expr COMPARE_OP POP_JUMP_IF_FALSE
+         match_guard312     ::= expr POP_JUMP_IF_FALSE
+
+         # Or-pattern: int() | float() → checks second class after first fails
+         match_or_class312  ::= COPY expr LOAD_CONST MATCH_CLASS match_class_check312
+
+         # case [] (empty sequence)
+         match_case_arm312  ::= COPY MATCH_SEQUENCE POP_JUMP_IF_FALSE
+                                 GET_LEN expr COMPARE_OP POP_JUMP_IF_FALSE
+                                 POP_TOP POP_TOP match_case_body312
+                                 _come_froms POP_TOP
+
+         # case [x] (single-element sequence)
+         match_case_arm312  ::= COPY MATCH_SEQUENCE POP_JUMP_IF_FALSE
+                                 GET_LEN expr COMPARE_OP POP_JUMP_IF_FALSE
+                                 UNPACK_SEQUENCE match_class_stores312
+                                 POP_TOP match_case_body312
+                                 _come_froms POP_TOP
+
+         # case [first, second] (fixed-length sequence)
+         match_case_arm312  ::= COPY MATCH_SEQUENCE POP_JUMP_IF_FALSE
+                                 GET_LEN expr COMPARE_OP POP_JUMP_IF_FALSE
+                                 UNPACK_SEQUENCE match_class_stores312
+                                 POP_TOP match_case_body312
+                                 _come_froms POP_TOP
+
+         # case [first, *rest] (star pattern)
+         match_case_arm312  ::= COPY MATCH_SEQUENCE POP_JUMP_IF_FALSE
+                                 GET_LEN expr COMPARE_OP POP_JUMP_IF_FALSE
+                                 UNPACK_EX match_class_stores312
+                                 POP_TOP match_case_body312
+                                 _come_froms POP_TOP
+
+         # case {key: value} (mapping match)
+         match_case_arm312  ::= COPY MATCH_MAPPING POP_JUMP_IF_FALSE
+                                 match_mapping_body312
+                                 _come_froms POP_TOP
+
+         # Mapping match body: GET_LEN check + MATCH_KEYS + unpack + body
+         match_mapping_body312 ::= GET_LEN expr COMPARE_OP POP_JUMP_IF_FALSE
+                                    LOAD_CONST MATCH_KEYS COPY POP_JUMP_IF_NONE
+                                    UNPACK_SEQUENCE match_class_stores312
+                                    POP_TOP POP_TOP POP_TOP match_case_body312
+                                    _come_froms POP_TOP POP_TOP
+         # Mapping with **rest capture
+         match_mapping_body312 ::= GET_LEN expr COMPARE_OP POP_JUMP_IF_FALSE
+                                    LOAD_CONST MATCH_KEYS COPY POP_JUMP_IF_NONE
+                                    UNPACK_SEQUENCE
+                                    match_mapping_extra312
+                                    match_class_stores312
+                                    POP_TOP match_case_body312
+                                    _come_froms POP_TOP POP_TOP
+         match_mapping_extra312 ::= BUILD_MAP_0 DICT_UPDATE UNPACK_SEQUENCE
+                                     COPY DELETE_SUBSCR COPY DELETE_SUBSCR
+
+         # case [*_, last] with guard (complex sequence with star and guard)
+         match_case_arm312  ::= MATCH_SEQUENCE POP_JUMP_IF_FALSE
+                                 GET_LEN expr COMPARE_OP POP_JUMP_IF_FALSE
+                                 match_seq_complex312
+                                 _come_froms POP_TOP
+
+         match_seq_complex312 ::= COPY GET_LEN expr BINARY_SUBTRACT BINARY_SUBSCR
+                                   store POP_TOP expr match_seq_guard312
+
+         match_seq_guard312 ::= match_case_body312
+         match_seq_guard312 ::= COPY store expr COMPARE_OP POP_JUMP_IF_FALSE match_case_body312
+
+         # Match case body: returns or statements
+         match_case_body312 ::= return_const
+         match_case_body312 ::= return_expr RETURN_VALUE
+         match_case_body312 ::= l_stmts_opt
+
+         # case Point(x=0, y=0) with keyword attrs
+         match_case_arm312  ::= COPY expr LOAD_CONST MATCH_CLASS match_class_guard_capture312 _come_froms
+
+         match_class_guard_capture312 ::= COPY POP_JUMP_IF_NONE match_class_unpack312
+                                           match_class_value_checks312
+                                           POP_TOP match_case_body312
+                                           _come_froms POP_TOP
+
+         # Value checks within class patterns: compare unpacked values against constants
+         match_class_value_checks312 ::= expr COMPARE_OP POP_JUMP_IF_FALSE
+                                          expr COMPARE_OP POP_JUMP_IF_FALSE
+         match_class_value_checks312 ::= expr COMPARE_OP POP_JUMP_IF_FALSE
+
+         # case Circle(color=Color.RED) with attribute access guard
+         match_class_guard_capture312 ::= COPY POP_JUMP_IF_NONE match_class_unpack312
+                                           expr expr COMPARE_OP POP_JUMP_IF_FALSE
+                                           POP_TOP match_case_body312
+                                           _come_froms POP_TOP
+
+         # Default case (_): catches everything remaining
+         match_case_default312 ::= POP_TOP match_case_body312
 
          # Lambda definition in 3.12
          # lambda: LOAD_LAMBDA <code_obj> LOAD_STR <lambda> MAKE_FUNCTION_0
@@ -225,6 +416,18 @@ class Python312Parser(Python38Parser):
          # Used for: x is True, x is False, x is not None
          expr               ::= is_op312
          is_op312           ::= expr expr IS_OP
+
+         # CONTAINS_OP: in/not in (Python 3.12 uses CONTAINS_OP for membership tests)
+         expr               ::= contains_op312
+         contains_op312     ::= expr expr CONTAINS_OP
+
+         # Subscript store: obj[key] = value
+         stmt               ::= store_subscr312
+         store_subscr312    ::= expr expr expr STORE_SUBSCR
+
+         # Subscript delete: del obj[key]
+         stmt               ::= delete_subscr312
+         delete_subscr312   ::= expr expr DELETE_SUBSCR
 
          # RAISE_VARARGS_1 as a standalone statement (raise ExcType(args))
          stmt               ::= raise_stmt312

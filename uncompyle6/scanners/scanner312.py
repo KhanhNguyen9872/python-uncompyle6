@@ -399,7 +399,18 @@ class Scanner312(Scanner):
             if opname in ("RESUME", "CACHE", "COPY_FREE_VARS", "MAKE_CELL",
                           "PUSH_EXC_INFO", "INTERPRETER_EXIT", "NOP",
                           "SWAP", "RERAISE", "WITH_EXCEPT_START",
-                          "LOAD_FAST_AND_CLEAR"):
+                          "LOAD_FAST_AND_CLEAR",
+                          "CLEANUP_THROW", "CALL_INTRINSIC_1"):
+                continue
+
+            # RETURN_GENERATOR + POP_TOP is internal generator setup - skip both
+            if opname == "RETURN_GENERATOR":
+                # Also skip the following POP_TOP
+                if i + 1 < len(self.insts) and self.insts[i + 1].opname == "POP_TOP":
+                    self._return_gen_skip_next_pop_top = True
+                continue
+            if opname == "POP_TOP" and getattr(self, '_return_gen_skip_next_pop_top', False):
+                self._return_gen_skip_next_pop_top = False
                 continue
 
             # PUSH_NULL is a calling convention detail - skip it
@@ -696,6 +707,24 @@ class Scanner312(Scanner):
                 opname = "COMPARE_OP"
                 pattr = "exception-match"
                 argval = "exception-match"
+
+            elif opname == "CONTAINS_OP":
+                # In 3.12, CONTAINS_OP replaces COMPARE_OP for 'in'/'not in'
+                # arg=0 means 'in', arg=1 means 'not in'
+                opname = "CONTAINS_OP"
+                if inst.arg == 0:
+                    pattr = "in"
+                else:
+                    pattr = "not in"
+
+            elif opname == "LOAD_SUPER_ATTR":
+                # In 3.12, LOAD_SUPER_ATTR is used for super().attr
+                # Strip any prefix that xdis might add
+                if isinstance(pattr, str):
+                    for prefix in ("NULL|self + ", "NULL + "):
+                        if pattr.startswith(prefix):
+                            pattr = pattr[len(prefix):]
+                            break
             
             elif opname == "LOAD_GLOBAL":
                 # In 3.12, low bit of arg controls NULL pushing
@@ -767,21 +796,30 @@ class Scanner312(Scanner):
                             optype="jrel",
                         )
 
-        # Post-processing: Strip tokens after the last RETURN_CONST None
-        # Python 3.12's inline comprehensions leave exception cleanup tokens
-        # (POP_TOP, STORE_FAST, etc.) after the module's final RETURN_CONST None.
+        # Post-processing: Strip dead code after the final return statement
+        # Python 3.12's for loops and inline comprehensions leave exception cleanup
+        # tokens (POP_TOP, STORE_FAST, etc.) after the function's final return.
         # These can't be parsed, so we remove them.
-        # Only strip when RETURN_CONST returns None (module level cleanup).
-        # Don't strip after RETURN_CONST with a value (e.g. return 1).
         if len(tokens) >= 2:
-            last_rc_idx = None
+            # Find the last return-like instruction
+            last_return_idx = None
             for idx in range(len(tokens) - 1, -1, -1):
-                if tokens[idx].kind == "RETURN_CONST" and tokens[idx].pattr in (None, 'None'):
-                    last_rc_idx = idx
+                if tokens[idx].kind in ("RETURN_CONST", "RETURN_VALUE"):
+                    last_return_idx = idx
                     break
-            if last_rc_idx is not None and last_rc_idx < len(tokens) - 1:
-                # Remove all tokens after the last RETURN_CONST None
-                tokens = tokens[:last_rc_idx + 1]
+            if last_return_idx is not None and last_return_idx < len(tokens) - 1:
+                # Check if everything after the return is dead code
+                # (POP_TOP, STORE_FAST, STORE_NAME, NOP only — NOT COME_FROM
+                #  since COME_FROM indicates a jump target = reachable code)
+                dead_ops = frozenset(("POP_TOP", "STORE_FAST", "STORE_NAME",
+                                      "NOP"))
+                all_dead = True
+                for idx in range(last_return_idx + 1, len(tokens)):
+                    if tokens[idx].kind not in dead_ops:
+                        all_dead = False
+                        break
+                if all_dead:
+                    tokens = tokens[:last_return_idx + 1]
         # Post-processing: detect BREAK_LOOP
         jump_back_targets: Dict[int, int] = {}
         for token in tokens:
