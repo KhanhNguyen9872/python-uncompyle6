@@ -442,6 +442,16 @@ class Scanner312(Scanner):
             pattr = inst.argrepr
             opname = inst.opname
 
+            # Strip "NULL + " prefix from LOAD_GLOBAL in Python 3.12
+            # dis module adds this to show PUSH_NULL but we handle it separately
+            if opname == "LOAD_GLOBAL" and isinstance(pattr, str) and pattr.startswith("NULL + "):
+                pattr = pattr[7:]  # Remove "NULL + " prefix
+
+            # Strip "NULL|self + " prefix from LOAD_ATTR in Python 3.12
+            # dis module adds this for method-resolution LOAD_ATTR (odd oparg)
+            if opname == "LOAD_ATTR" and isinstance(pattr, str) and pattr.startswith("NULL|self + "):
+                pattr = pattr[12:]  # Remove "NULL|self + " prefix
+
             # Handle 3.12-specific opcode translations
 
             if opname == "BINARY_OP":

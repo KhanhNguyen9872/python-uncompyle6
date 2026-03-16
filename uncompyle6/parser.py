@@ -652,6 +652,7 @@ class PythonParser(GenericASTBuilder):
 
 def parse(p, tokens, customize, code):
     p.customize_grammar_rules(tokens, customize)
+    p.code_object = code  # Store for exception-table-aware parsing
     ast = p.parse(tokens)
     #  p.cleanup()
     return ast

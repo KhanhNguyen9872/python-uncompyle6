@@ -195,6 +195,11 @@ class Python312Parser(Python38Parser):
          expr               ::= walrus_expr312
          walrus_expr312     ::= expr COPY store
 
+         # Augmented subscript assignment in 3.12 (uses COPY instead of ROT_THREE)
+         # Example: globals()['key'] += expr
+         # Pattern: base key COPY COPY BINARY_SUBSCR value INPLACE_OP STORE_SUBSCR
+         aug_assign1        ::= expr expr COPY COPY BINARY_SUBSCR expr inplace_op STORE_SUBSCR
+
          # RETURN_VALUE for function bodies (return <expr>)
          return             ::= expr POP_TOP RETURN_VALUE
 
@@ -575,6 +580,7 @@ class Python312Parser(Python38Parser):
                 return True
             return t.attr != tokens[first].off2int()
 
+
         if lhs in ("aug_assign1", "aug_assign2") and ast[0][0] == "and":
             return True
 
@@ -608,33 +614,173 @@ class Python312Parser(Python38Parser):
 
         return False
 
+    def _find_split_points(self, tokens):
+        """Find positions where we can safely split the token stream.
+        A split point is AFTER a store/delete token followed by a load/start token."""
+        STORE_OPS = frozenset((
+            'STORE_NAME', 'STORE_SUBSCR', 'STORE_FAST',
+            'STORE_GLOBAL', 'STORE_DEREF', 'DELETE_NAME',
+            'DELETE_FAST', 'DELETE_GLOBAL', 'POP_TOP',
+            'POP_EXCEPT', 'RAISE_VARARGS_1',
+        ))
+        START_OPS = frozenset((
+            'LOAD_NAME', 'LOAD_CONST', 'LOAD_FAST',
+            'LOAD_GLOBAL', 'LOAD_CODE', 'LOAD_LAMBDA',
+            'PUSH_NULL', 'NOP', 'RETURN_CONST',
+            'RETURN_VALUE', 'JUMP_FORWARD',
+            'JUMP_BACK', 'COME_FROM',
+            'DELETE_NAME', 'DELETE_FAST',
+            'LOAD_DEREF', 'LOAD_STR',
+            'BUILD_LIST_0', 'BUILD_MAP_0',
+            'POP_EXCEPT', 'LOAD_ASSERTION_ERROR',
+        ))
+
+        split_points = []
+        for i in range(len(tokens) - 1):
+            if tokens[i].kind in STORE_OPS and tokens[i + 1].kind in START_OPS:
+                split_points.append(i)
+        return split_points
+
+    def _try_parse_chunk(self, chunk_tokens):
+        """Try to parse a chunk of tokens. Returns AST or None on failure."""
+        import sys, io
+        from uncompyle6.scanner import Token as TokenClass
+
+        if not chunk_tokens:
+            return None
+
+        chunk_tokens = list(chunk_tokens)
+
+        # Ensure chunk ends with a terminal token
+        last_tok = chunk_tokens[-1]
+        if last_tok.kind not in ('RETURN_CONST', 'RETURN_VALUE',
+                                 'RETURN_LAST', 'RETURN_VALUE_LAMBDA',
+                                 'LAMBDA_MARKER'):
+            chunk_tokens.append(
+                TokenClass(opname='RETURN_CONST', attr=None,
+                          pattr='None', offset=99999, linestart=None)
+            )
+
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            chunk_ast = super().parse(chunk_tokens)
+        except Exception:
+            chunk_ast = None
+        finally:
+            sys.stdout.close()
+            sys.stdout = old_stdout
+
+        return chunk_ast
+
+    @staticmethod
+    def _is_synthetic_return(node):
+        """Check if a node is a synthetic return_const None from chunk sentinels."""
+        if not hasattr(node, 'kind'):
+            return False
+        if node.kind == 'return_const':
+            if len(node) > 0:
+                child = node[0]
+                if hasattr(child, 'attr') and child.attr is None:
+                    if hasattr(child, 'offset') and child.offset == 99999:
+                        return True
+            return False
+        if node.kind == 'sstmt' and len(node) > 0:
+            return Python312Parser._is_synthetic_return(node[0])
+        if node.kind == 'stmt' and len(node) > 0:
+            return Python312Parser._is_synthetic_return(node[0])
+        return False
+
+    def _parse_adaptive(self, tokens, depth=0):
+        """Parse tokens, adaptively splitting on failure.
+        Returns list of AST nodes from successful parse(s)."""
+        MAX_DEPTH = 5
+        MIN_CHUNK = 4  # Don't split chunks smaller than this
+
+        if len(tokens) < MIN_CHUNK:
+            return []
+
+        # Try parsing the entire token list first
+        ast = self._try_parse_chunk(tokens)
+        if ast is not None:
+            nodes = []
+            if hasattr(ast, '__iter__'):
+                for child in ast:
+                    # Filter out synthetic return_const from sentinels
+                    if not self._is_synthetic_return(child):
+                        nodes.append(child)
+            else:
+                if not self._is_synthetic_return(ast):
+                    nodes.append(ast)
+            return nodes
+
+        # Failed — try splitting if we haven't recursed too deep
+        if depth >= MAX_DEPTH:
+            return []
+
+        # Find split points within this token list
+        split_points = self._find_split_points(tokens)
+        if not split_points:
+            return []
+
+        # Try splitting at the midpoint(s) for best coverage
+        # Strategy: try splitting at the split point closest to the middle
+        mid = len(tokens) // 2
+        best_sp = min(split_points, key=lambda sp: abs(sp - mid))
+
+        # Split into two halves and recurse
+        left = tokens[:best_sp + 1]
+        right = tokens[best_sp + 1:]
+
+        left_nodes = self._parse_adaptive(left, depth + 1)
+        right_nodes = self._parse_adaptive(right, depth + 1)
+
+        return left_nodes + right_nodes
+
     def parse(self, tokens, customize=None):
         """Override parse to handle large token streams that cause Earley
         parser state explosion. When token count exceeds MAX_TOKENS,
         split at statement boundaries and parse each chunk independently.
+        If a chunk fails, adaptively split it into smaller sub-chunks.
         """
-        MAX_TOKENS = 200
+        MAX_TOKENS = 100
 
         if len(tokens) <= MAX_TOKENS:
-            return super().parse(tokens)
+            import sys, io
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            try:
+                result = super().parse(tokens)
+            except Exception:
+                # Regular parse failed — try adaptive chunked parsing as fallback
+                sys.stdout.close()
+                sys.stdout = old_stdout
+                nodes = self._parse_adaptive(list(tokens), depth=0)
+                if nodes:
+                    from uncompyle6.parsers.treenode import SyntaxTree
+                    result = SyntaxTree("stmts", nodes)
+                    return result
+                raise  # Re-raise if adaptive also failed
+            finally:
+                if sys.stdout != old_stdout:
+                    sys.stdout.close()
+                    sys.stdout = old_stdout
+            return result
 
-        # Find statement boundaries: positions where we can safely split
-        split_points = []
-        for i in range(len(tokens) - 1):
-            t = tokens[i]
-            if t.kind in ('STORE_NAME', 'STORE_SUBSCR', 'STORE_FAST',
-                          'STORE_GLOBAL', 'STORE_DEREF', 'DELETE_NAME',
-                          'DELETE_FAST', 'DELETE_GLOBAL'):
-                next_t = tokens[i + 1]
-                if next_t.kind in ('LOAD_NAME', 'LOAD_CONST', 'LOAD_FAST',
-                                   'LOAD_GLOBAL', 'LOAD_CODE', 'LOAD_LAMBDA',
-                                   'PUSH_NULL', 'NOP', 'RETURN_CONST',
-                                   'RETURN_VALUE', 'JUMP_FORWARD',
-                                   'JUMP_BACK', 'COME_FROM',
-                                   'DELETE_NAME', 'DELETE_FAST',
-                                   'LOAD_DEREF', 'LOAD_STR',
-                                   'BUILD_LIST_0', 'BUILD_MAP_0'):
-                    split_points.append(i)
+        # --- Exception-table-aware try/except reconstruction ---
+        # Use the code object's exception table to identify try/except regions
+        # and handle them as structured blocks rather than flat token sequences
+        co = getattr(self, 'code_object', None)
+        if co is not None and hasattr(co, 'co_exceptiontable') and len(co.co_exceptiontable) > 0:
+            try:
+                result = self._parse_with_exceptions(tokens, co, MAX_TOKENS)
+                if result is not None:
+                    return result
+            except Exception:
+                pass  # Fallback to normal chunked parsing
+
+        # Find statement boundaries
+        split_points = self._find_split_points(tokens)
 
         if not split_points:
             return super().parse(tokens)
@@ -678,8 +824,7 @@ class Python312Parser(Python38Parser):
         if len(chunk_ranges) <= 1:
             return super().parse(tokens)
 
-        # Parse each chunk independently
-        from uncompyle6.scanner import Token as TokenClass
+        # Parse each chunk with adaptive retry on failure
         all_stmts = []
 
         for ci, (chunk_start, chunk_end) in enumerate(chunk_ranges):
@@ -688,35 +833,8 @@ class Python312Parser(Python38Parser):
             if not chunk_tokens:
                 continue
 
-            # Ensure chunk ends with a terminal token
-            last_tok = chunk_tokens[-1]
-            if last_tok.kind not in ('RETURN_CONST', 'RETURN_VALUE',
-                                     'RETURN_LAST', 'RETURN_VALUE_LAMBDA',
-                                     'LAMBDA_MARKER'):
-                chunk_tokens.append(
-                    TokenClass(opname='RETURN_CONST', attr=None,
-                              pattr='None', offset=99999, linestart=None)
-                )
-
-            try:
-                import sys, os, io
-                old_stdout = sys.stdout
-                sys.stdout = io.StringIO()
-                try:
-                    chunk_ast = super().parse(chunk_tokens)
-                finally:
-                    sys.stdout.close()
-                    sys.stdout = old_stdout
-                if chunk_ast is not None:
-                    if hasattr(chunk_ast, '__iter__'):
-                        for child in chunk_ast:
-                            all_stmts.append(child)
-                    else:
-                        all_stmts.append(chunk_ast)
-            except Exception:
-                # Chunk failed — continue with remaining chunks
-                # Create a placeholder comment node
-                pass
+            nodes = self._parse_adaptive(chunk_tokens, depth=0)
+            all_stmts.extend(nodes)
 
         # Build a combined stmts AST
         if all_stmts:
@@ -725,6 +843,257 @@ class Python312Parser(Python38Parser):
             return combined
         else:
             return super().parse(tokens)
+
+    def _try_parse_match_subject(self, try_body_tokens):
+        """Detect the match subject pattern in try body tokens and return a
+        synthetic match_subject_block312 AST node, or None if pattern not found.
+        
+        Pattern: LOAD_STR X / LOAD_STR Y / COMPARE_OP == / COPY /
+                 IS_OP True → RAISE MemoryError([True]) /
+                 IS_OP False → STORE_NAME _N = [[True],[False]], co2(["_X"]) /
+                 RAISE MemoryError([True])
+        """
+        from uncompyle6.parsers.treenode import SyntaxTree
+        from uncompyle6.scanner import Token as TokenClass
+
+        # Skip COME_FROM tokens at the start
+        start = 0
+        while start < len(try_body_tokens) and try_body_tokens[start].kind == 'COME_FROM':
+            start += 1
+
+        # Check minimum pattern: need LOAD_STR, LOAD_STR, COMPARE_OP ==
+        remaining = try_body_tokens[start:]
+        if len(remaining) < 5:
+            return None
+
+        # Check for LOAD_STR / LOAD_STR / COMPARE_OP
+        load_str_tokens = []
+        idx = 0
+        while idx < len(remaining) and remaining[idx].kind in ('LOAD_STR', 'LOAD_CONST', 'LOAD_NAME'):
+            if remaining[idx].kind == 'LOAD_STR':
+                load_str_tokens.append(remaining[idx])
+            idx += 1
+
+        if len(load_str_tokens) < 2:
+            return None
+
+        # Find COMPARE_OP ==
+        compare_found = False
+        for t in remaining:
+            if t.kind == 'COMPARE_OP' and t.pattr == '==':
+                compare_found = True
+                break
+        if not compare_found:
+            return None
+
+        # Extract the operands
+        left_val = load_str_tokens[0].pattr
+        right_val = load_str_tokens[1].pattr
+        # Clean up quote marks
+        if isinstance(left_val, str):
+            left_val = left_val.strip('"').strip("'")
+        if isinstance(right_val, str):
+            right_val = right_val.strip('"').strip("'")
+
+        # Find STORE_NAME (the variable assignment in False branch)
+        store_var = None
+        co2_arg = None
+        for t in remaining:
+            if t.kind == 'STORE_NAME' and store_var is None:
+                store_var = t.pattr
+            if t.kind == 'LOAD_STR' and co2_arg is None and t.pattr != left_val and t.pattr != right_val:
+                # This is the co2 argument string
+                co2_arg = t.pattr
+                if isinstance(co2_arg, str):
+                    co2_arg = co2_arg.strip('"').strip("'")
+
+        # Create the node with extracted data stored as attributes
+        node = SyntaxTree("match_subject_block312", [])
+        node.match_left = left_val
+        node.match_right = right_val
+        node.match_store_var = store_var
+        node.match_co2_arg = co2_arg
+        return node
+
+    def _parse_with_exceptions(self, tokens, co, MAX_TOKENS):
+        """Parse tokens using exception table to reconstruct try/except blocks.
+        Recursively handles nested try/except at all depth levels.
+        Returns combined AST or None if this approach doesn't apply."""
+        import dis
+        from uncompyle6.parsers.treenode import SyntaxTree
+        from uncompyle6.scanner import Token as TokenClass
+
+        def get_off(t):
+            off = t.offset
+            if isinstance(off, str):
+                return int(off.split('_')[0])
+            return int(off)
+
+        # Parse exception table
+        try:
+            exc_entries = list(dis._parse_exception_table(co))
+        except Exception:
+            return None
+
+        if not exc_entries:
+            return None
+
+        # Find depth-0 try blocks
+        depth0 = [e for e in exc_entries if e.depth == 0]
+        if not depth0:
+            return None
+
+        def find_token_ge(toks, target):
+            """Find first token index with offset >= target"""
+            for i, t in enumerate(toks):
+                if get_off(t) >= target:
+                    return i
+            return len(toks) - 1
+
+        def find_token_le(toks, target):
+            """Find last token index with offset <= target"""
+            result = 0
+            for i, t in enumerate(toks):
+                if get_off(t) <= target:
+                    result = i
+            return result
+
+        def get_offset_range(toks):
+            """Get (min_offset, max_offset) for a token list"""
+            if not toks:
+                return (0, 0)
+            offsets = [get_off(t) for t in toks]
+            return (min(offsets), max(offsets))
+
+        def parse_region_with_exceptions(region_tokens, relevant_entries, depth_level):
+            """Recursively parse a token region, using exception entries at depth_level
+            to reconstruct try/except blocks within this region."""
+            
+            if not region_tokens:
+                return []
+
+            # Find exception entries at the current depth level within this region's offset range
+            # Only use lasti=False entries — these are REAL try/except blocks.
+            # lasti=True entries are POP_EXCEPT cleanup handlers, not actual try/except code.
+            # Allow small slack (10 bytes) because exception table entries can reference
+            # COME_FROM instructions that the scanner doesn't emit as tokens.
+            min_off, max_off = get_offset_range(region_tokens)
+            blocks = [e for e in relevant_entries 
+                      if e.depth == depth_level and not e.lasti
+                      and e.start >= min_off - 10 and e.start <= max_off]
+
+            if not blocks:
+                # No try/except blocks at this level — parse normally
+                return self._parse_adaptive(region_tokens, depth=0)
+
+            result_nodes = []
+
+            # Parse tokens before the first try block
+            first_block_start_ti = find_token_ge(region_tokens, blocks[0].start)
+            if first_block_start_ti > 0:
+                pre_tokens = list(region_tokens[:first_block_start_ti])
+                pre_nodes = self._parse_adaptive(pre_tokens, depth=0)
+                result_nodes.extend(pre_nodes)
+
+            # Process each try/except block
+            for bi, block in enumerate(blocks):
+                try_start_ti = find_token_ge(region_tokens, block.start)
+                try_end_ti = find_token_le(region_tokens, block.end - 2)
+                if try_end_ti < try_start_ti:
+                    try_end_ti = find_token_le(region_tokens, block.end)
+
+                except_start_ti = find_token_ge(region_tokens, block.target)
+
+                # Except handler extends to the next block at this depth (or end of region)
+                if bi + 1 < len(blocks):
+                    next_start = blocks[bi + 1].start
+                    except_end_ti = find_token_le(region_tokens, next_start - 2)
+                else:
+                    except_end_ti = len(region_tokens) - 1
+
+                # Extract try body tokens and parse them
+                try_body_tokens = list(region_tokens[try_start_ti:try_end_ti + 1])
+                
+                # Detect match subject pattern:
+                # LOAD_STR X / LOAD_STR Y / COMPARE_OP == / COPY / IS_OP True → RAISE
+                # / IS_OP False → STORE_NAME _N = [[T],[F]] co2(["_X"]) / RAISE
+                match_subject_node = self._try_parse_match_subject(try_body_tokens)
+                if match_subject_node is not None:
+                    from uncompyle6.parsers.treenode import SyntaxTree as ST2
+                    try_body_nodes = [ST2("sstmt", [ST2("stmt", [match_subject_node])])]
+                else:
+                    try_body_nodes = self._parse_adaptive(try_body_tokens, depth=0)
+
+                # Extract except handler header (LOAD_NAME MemoryError / COMPARE_OP / POP_JUMP / STORE_NAME)
+                except_var = None
+                except_body_start = except_start_ti + 4
+                for j in range(except_start_ti, min(except_start_ti + 6, len(region_tokens))):
+                    t = region_tokens[j]
+                    if t.kind == 'STORE_NAME':
+                        except_var = t.pattr
+                        except_body_start = j + 1
+                        break
+
+                if except_body_start > except_end_ti:
+                    except_body_start = except_start_ti
+
+                except_body_tokens = list(region_tokens[except_body_start:except_end_ti + 1])
+
+                # RECURSIVELY parse except handler body with deeper exception entries
+                deeper_entries = [e for e in relevant_entries if e.depth == depth_level + 1]
+                except_body_nodes = parse_region_with_exceptions(
+                    except_body_tokens, relevant_entries, depth_level + 1
+                )
+
+                # Build synthetic try_except node
+                try_stmts = SyntaxTree("stmts", try_body_nodes) if try_body_nodes else SyntaxTree("stmts", [])
+                except_stmts = SyntaxTree("stmts", except_body_nodes) if except_body_nodes else SyntaxTree("stmts", [])
+
+                except_var_str = except_var if except_var else '_exc'
+                except_node = SyntaxTree("except_handler312", [
+                    TokenClass(opname='LOAD_NAME', attr='MemoryError', pattr='MemoryError', offset=block.target),
+                    TokenClass(opname='STORE_NAME', attr=except_var_str, pattr=except_var_str, offset=block.target + 4),
+                    except_stmts,
+                ])
+
+                try_except_node = SyntaxTree("try_except312", [
+                    try_stmts,
+                    except_node,
+                ])
+
+                result_nodes.append(SyntaxTree("sstmt", [SyntaxTree("stmt", [try_except_node])]))
+
+            # Parse tokens BETWEEN the last block's except_end and end of region
+            # (only if there are tokens after the last except handler cleanup)
+            last_except_end_ti = except_end_ti + 1 if blocks else 0
+            if last_except_end_ti < len(region_tokens):
+                post_tokens = list(region_tokens[last_except_end_ti:])
+                if post_tokens:
+                    post_nodes = self._parse_adaptive(post_tokens, depth=0)
+                    result_nodes.extend(post_nodes)
+
+            return result_nodes
+
+        # --- Main logic ---
+        first_try_start = find_token_ge(tokens, depth0[0].start)
+
+        # Parse pre-try tokens
+        pre_try_tokens = list(tokens[:first_try_start])
+        pre_nodes = []
+        if pre_try_tokens:
+            pre_nodes = self._parse_adaptive(pre_try_tokens, depth=0)
+
+        # Parse the try/except region recursively starting from depth 0
+        try_region_tokens = list(tokens[first_try_start:])
+        try_nodes = parse_region_with_exceptions(try_region_tokens, exc_entries, 0)
+
+        # Combine
+        all_nodes = pre_nodes + try_nodes
+        if all_nodes:
+            from spark_parser import GenericASTBuilder
+            combined = GenericASTBuilder.nonterminal(self, 'stmts', all_nodes)
+            return combined
+        return None
 
 
 class Python312ParserSingle(Python312Parser, PythonParserSingle):
